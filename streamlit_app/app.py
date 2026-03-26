@@ -4,9 +4,21 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import torch
 import pandas as pd
+from huggingface_hub import snapshot_download
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+REQUIRED_DATA_FILES = ["fine_tuned_embeddings.npy", "default_embeddings.npy", "job_postings.parquet"]
+REQUIRED_MODEL_FILES = [
+    "config.json",
+    "config_sentence_transformers.json",
+    "modules.json",
+    "model.safetensors",
+    "sentence_bert_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    os.path.join("1_Pooling", "config.json"),
+]
 
 # Set up page configuration and CSS.
 st.set_page_config(page_title="Job Match Explorer", layout="centered")
@@ -161,25 +173,87 @@ if "app_state" not in st.session_state:
     st.session_state.app_state = "search"
 
 # ----- Functions for loading resources -----
+def get_config_value(key, default=None):
+    value = os.getenv(key)
+    if value:
+        return value
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def data_assets_exist(data_dir):
+    has_main_files = all(os.path.exists(os.path.join(data_dir, file_name)) for file_name in REQUIRED_DATA_FILES)
+    model_dir = os.path.join(data_dir, "fine_tuned_model")
+    has_model_files = all(
+        os.path.exists(os.path.join(model_dir, file_name)) for file_name in REQUIRED_MODEL_FILES
+    )
+    return has_main_files and has_model_files
+
+
 @st.cache_resource
-def load_fine_tuned_embeddings():
-    embeddings = np.load(os.path.join(DATA_DIR, 'fine_tuned_embeddings.npy'))
+def resolve_data_dir():
+    if data_assets_exist(DATA_DIR):
+        return DATA_DIR
+
+    repo_id = get_config_value("HF_ASSET_REPO_ID")
+    repo_type = get_config_value("HF_ASSET_REPO_TYPE", "dataset")
+    revision = get_config_value("HF_ASSET_REVISION", "main")
+    token = get_config_value("HF_TOKEN")
+
+    if not repo_id:
+        raise FileNotFoundError(
+            "Missing local data assets and no HF_ASSET_REPO_ID configured for remote download."
+        )
+
+    snapshot_path = snapshot_download(
+        repo_id=repo_id,
+        repo_type=repo_type,
+        revision=revision,
+        token=token,
+        allow_patterns=[
+            "fine_tuned_embeddings.npy",
+            "default_embeddings.npy",
+            "job_postings.parquet",
+            "fine_tuned_model/config.json",
+            "fine_tuned_model/config_sentence_transformers.json",
+            "fine_tuned_model/modules.json",
+            "fine_tuned_model/model.safetensors",
+            "fine_tuned_model/sentence_bert_config.json",
+            "fine_tuned_model/tokenizer.json",
+            "fine_tuned_model/tokenizer_config.json",
+            "fine_tuned_model/1_Pooling/config.json",
+        ],
+    )
+
+    if not data_assets_exist(snapshot_path):
+        raise FileNotFoundError(
+            "Downloaded snapshot is missing required data/model files for the app."
+        )
+
+    return snapshot_path
+
+
+@st.cache_resource
+def load_fine_tuned_embeddings(data_dir):
+    embeddings = np.load(os.path.join(data_dir, 'fine_tuned_embeddings.npy'))
     return embeddings
 
 @st.cache_resource
-def load_default_embeddings():
-    embeddings = np.load(os.path.join(DATA_DIR, 'default_embeddings.npy'))
+def load_default_embeddings(data_dir):
+    embeddings = np.load(os.path.join(data_dir, 'default_embeddings.npy'))
     return embeddings
 
 @st.cache_resource
-def load_job_postings():
-    job_postings_df = pd.read_parquet(os.path.join(DATA_DIR, 'job_postings.parquet'))
+def load_job_postings(data_dir):
+    job_postings_df = pd.read_parquet(os.path.join(data_dir, 'job_postings.parquet'))
     job_postings_df['posting'] = job_postings_df['job_posting_title'] + ' @ ' + job_postings_df['company']
     return job_postings_df['posting'].to_list()
 
 @st.cache_resource
-def load_fine_tuned_model():
-    fine_tuned_model_path = os.path.join(DATA_DIR, 'fine_tuned_model')
+def load_fine_tuned_model(data_dir):
+    fine_tuned_model_path = os.path.join(data_dir, 'fine_tuned_model')
     model = SentenceTransformer(fine_tuned_model_path, device=device)
     return model
 
@@ -189,12 +263,27 @@ def load_default_model():
     return model
 
 # ----- Load Resources -----
-# For demonstration, limit to the first 5000 job postings.
-fine_tuned_embeddings = torch.tensor(load_fine_tuned_embeddings()[:5000], device=device)
-default_embeddings = torch.tensor(load_default_embeddings()[:5000], device=device)
-job_postings = load_job_postings()[:5000]
-fine_tuned_model = load_fine_tuned_model()
-default_model = load_default_model()
+try:
+    with st.spinner("Loading models and embeddings..."):
+        runtime_data_dir = resolve_data_dir()
+        fine_tuned_embeddings = torch.tensor(load_fine_tuned_embeddings(runtime_data_dir)[:5000], device=device)
+        default_embeddings = torch.tensor(load_default_embeddings(runtime_data_dir)[:5000], device=device)
+        job_postings = load_job_postings(runtime_data_dir)[:5000]
+        fine_tuned_model = load_fine_tuned_model(runtime_data_dir)
+        default_model = load_default_model()
+except Exception as exc:
+    st.error("Unable to load app assets. Configure Hugging Face asset settings for deployment.")
+    st.markdown(
+        """
+Required Streamlit secrets for cloud deployment:
+- `HF_ASSET_REPO_ID` (for example: `your-username/job-match-assets`)
+- `HF_ASSET_REPO_TYPE` (`dataset` or `model`, default: `dataset`)
+- `HF_ASSET_REVISION` (optional, default: `main`)
+- `HF_TOKEN` (optional for private repositories)
+"""
+    )
+    st.exception(exc)
+    st.stop()
 
 # =============================================================================
 # State Machine:
